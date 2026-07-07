@@ -8,3 +8,4 @@ geopy
 aiohttp
 tqdm
 pyarrow
+scipy
