@@ -9,3 +9,8 @@ aiohttp
 tqdm
 pyarrow
 scipy
+scikit-learn
+prophet
+matplotlib
+seaborn
+statsmodels
