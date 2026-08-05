@@ -763,7 +763,7 @@ def EVALUAR_METRICAS(y_real, y_predicho, num_parametros):
     Retorna
     -------
     dict
-        Diccionario con MAE, MSE, RMSE, MAPE, R² y R² ajustado.
+        Diccionario con MAE, MSE, RMSE, NRMSE y MAPE.
     """
 
     # Número de observaciones
@@ -773,6 +773,9 @@ def EVALUAR_METRICAS(y_real, y_predicho, num_parametros):
     mae = metrics.mean_absolute_error(y_real, y_predicho)
     mse = metrics.mean_squared_error(y_real, y_predicho)
     rmse = np.sqrt(mse)
+
+    # RMSE normalizado respecto a la media de los valores reales
+    nrmse = (rmse / np.mean(y_real)) * 100
 
     def MAPE(y_true, y_pred):
         y_true, y_pred = np.array(y_true), np.array(y_pred)
@@ -785,6 +788,7 @@ def EVALUAR_METRICAS(y_real, y_predicho, num_parametros):
         'MAE': mae,
         'MSE': mse,
         'RMSE': rmse,
+        'NRMSE': nrmse,
         'MAPE': mape
     }
 
@@ -795,6 +799,7 @@ def EVALUAR_METRICAS(y_real, y_predicho, num_parametros):
     print(f'Error cuadrático medio (MSE): {mse:.6f}')
     print(f'Raíz del error cuadrático medio (RMSE): {rmse:.6f}')
     print(f'Error porcentual absoluto medio (MAPE): {mape:.2f} %')
+    print(f'Raíz del error cuadrático medio normalizada (NRMSE): {nrmse:.2f} %')
 
     return resultados
 
