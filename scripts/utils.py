@@ -3,17 +3,19 @@ import pandas as pd
 import itertools
 from sklearn import metrics
 from pathlib import Path
+import random
 
 from prophet import Prophet
 from prophet.plot import add_changepoints_to_plot
 from prophet.diagnostics import cross_validation, performance_metrics
+import torch
+from neuralprophet import NeuralProphet
 
 from statsmodels.stats.outliers_influence import variance_inflation_factor
 from sklearn.impute import SimpleImputer
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import ParameterGrid
 from sklearn.metrics import mean_squared_error
-
 
 
 import warnings
@@ -53,6 +55,9 @@ light_style = {
 plt.rcParams.update(light_style)
 rcParams["figure.figsize"] = (18, 7)
 
+#############################################################################################
+##################################### FUNCIONES COMUNES #####################################
+#############################################################################################
 
 def CARGA_Y_FILTRO(contaminante, ciudad):
     """
@@ -829,6 +834,10 @@ def CALCULAR_VIF(datos, variables):
 
     return vif.sort_values("VIF", ascending=False).reset_index(drop=True)
 
+
+#############################################################################################
+##################################### FUNCIONES PROPHET #####################################
+#############################################################################################
 
 def BUSQUEDA_CONFIGURACIONES_PROPHET(
     configuraciones,
@@ -1712,4 +1721,1003 @@ def ENTRENAR_EVALUAR_PROPHET(
         metricas_validacion,
         train_prophet_final,
         validation_prophet_final
+    )
+
+
+#############################################################################################
+################################## FUNCIONES NEURALPROPHET ##################################
+#############################################################################################
+
+def BUSQUEDA_CONFIGURACIONES_NEURALPROPHET(
+    configuraciones,
+    train,
+    validation,
+    estacionalidades,
+    regresores_futuros,
+    regresores_retardados,
+    mostrar_resultado=True
+):
+    """
+    Ajusta y evalúa diferentes configuraciones de NeuralProphet.
+
+    Las estacionalidades indicadas en el argumento 'estacionalidades'
+    se aplican a todos los modelos. El número de términos de Fourier
+    utilizado en cada entrenamiento se obtiene de cada configuración.
+
+    Parámetros
+    ----------
+    configuraciones : list of dict
+        Lista de configuraciones que se desean evaluar.
+
+    train : pandas.DataFrame
+        Conjunto de entrenamiento. Debe contener las columnas 'ds', 'y',
+        los regresores futuros y los regresores retardados.
+
+    validation : pandas.DataFrame
+        Conjunto de validación. Debe contener las columnas 'ds', 'y',
+        los regresores futuros y los regresores retardados.
+
+    estacionalidades : list of str
+        Lista con las estacionalidades que se aplicarán a todos los modelos.
+
+        Valores permitidos:
+
+        - 'yearly'
+        - 'weekly'
+        - 'daily'
+
+        Ejemplo:
+
+        ['yearly', 'weekly', 'daily']
+
+    regresores_futuros : list of str
+        Lista con los regresores cuyos valores son conocidos durante
+        el periodo de predicción.
+
+    regresores_retardados : list of str
+        Lista con los regresores que se incorporarán mediante sus rezagos.
+
+    mostrar_resultado : bool, opcional
+        Si es True, muestra las estacionalidades utilizadas, los mejores
+        parámetros y el MSE de validación.
+
+    Retorna
+    -------
+    resultados_df : pandas.DataFrame
+        DataFrame con los resultados de todas las configuraciones.
+
+    resultados_correctos : pandas.DataFrame
+        Configuraciones ejecutadas correctamente, ordenadas de menor
+        a mayor MSE.
+
+    mejor_resultado : pandas.Series or None
+        Mejor configuración encontrada. Devuelve None si ninguna
+        configuración se ejecuta correctamente.
+
+    mejor_modelo : neuralprophet.NeuralProphet or None
+        Modelo entrenado con la mejor configuración. Devuelve None si
+        ninguna configuración se ejecuta correctamente.
+    """
+
+    # ==========================================================================
+    # NORMALIZACIÓN DE LAS ESTACIONALIDADES
+    # ==========================================================================
+
+    estacionalidades_normalizadas = [
+        estacionalidad.strip().lower()
+        for estacionalidad in estacionalidades
+    ]
+
+    estacionalidades_normalizadas = list(
+        dict.fromkeys(estacionalidades_normalizadas)
+    )
+
+    # ==========================================================================
+    # PARÁMETROS OBLIGATORIOS
+    # ==========================================================================
+
+    parametros_obligatorios = [
+        "changepoints_range",
+        "trend_reg",
+        "seasonality_mode",
+        "seasonality_reg",
+        "n_lags",
+        "ar_layers",
+        "lagged_reg_layers",
+        "epochs",
+        "batch_size",
+        "usar_festivos"
+    ]
+
+    # El orden de Fourier solo es obligatorio para las estacionalidades
+    # indicadas en el argumento estacionalidades.
+    if "yearly" in estacionalidades_normalizadas:
+        parametros_obligatorios.append(
+            "yearly_seasonality"
+        )
+
+    if "weekly" in estacionalidades_normalizadas:
+        parametros_obligatorios.append(
+            "weekly_seasonality"
+        )
+
+    if "daily" in estacionalidades_normalizadas:
+        parametros_obligatorios.append(
+            "daily_seasonality"
+        )
+
+    for indice, configuracion in enumerate(configuraciones):
+
+        parametros_faltantes = [
+            parametro
+            for parametro in parametros_obligatorios
+            if parametro not in configuracion
+        ]
+
+        if parametros_faltantes:
+            raise ValueError(
+                f"En la configuración {indice} faltan los parámetros:\n"
+                f"{parametros_faltantes}"
+            )
+
+    # ==========================================================================
+    # AJUSTE Y EVALUACIÓN DE LAS CONFIGURACIONES
+    # ==========================================================================
+
+    resultados_busqueda = []
+
+    for numero_configuracion, params in enumerate(
+        configuraciones,
+        start=1
+    ):
+
+        # ----------------------------------------------------------------------
+        # Estacionalidades y órdenes de Fourier utilizados
+        # ----------------------------------------------------------------------
+
+        yearly_seasonality = (
+            params["yearly_seasonality"]
+            if "yearly" in estacionalidades_normalizadas
+            else False
+        )
+
+        weekly_seasonality = (
+            params["weekly_seasonality"]
+            if "weekly" in estacionalidades_normalizadas
+            else False
+        )
+
+        daily_seasonality = (
+            params["daily_seasonality"]
+            if "daily" in estacionalidades_normalizadas
+            else False
+        )
+
+        # Indicador de utilización de festivos
+        usar_festivos = params["usar_festivos"]
+
+        # ----------------------------------------------------------------------
+        # Parámetros admitidos por NeuralProphet
+        # ----------------------------------------------------------------------
+
+        parametros_modelo = {
+
+            # Tendencia
+            "growth": "linear",
+            "changepoints_range": params["changepoints_range"],
+            "trend_reg": params["trend_reg"],
+
+            # Estacionalidad
+            "seasonality_mode": params["seasonality_mode"],
+            "seasonality_reg": params["seasonality_reg"],
+            "yearly_seasonality": yearly_seasonality,
+            "weekly_seasonality": weekly_seasonality,
+            "daily_seasonality": daily_seasonality,
+
+            # Autorregresión
+            "n_lags": params["n_lags"],
+            "n_forecasts": 1,
+            "ar_layers": params["ar_layers"],
+            "lagged_reg_layers": params["lagged_reg_layers"],
+
+            # Entrenamiento
+            "epochs": params["epochs"],
+            "batch_size": params["batch_size"]
+        }
+
+        try:
+
+            # ------------------------------------------------------------------
+            # Fijación de las semillas
+            # ------------------------------------------------------------------
+
+            np.random.seed(42)
+            random.seed(42)
+            torch.manual_seed(42)
+
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(42)
+
+            # ------------------------------------------------------------------
+            # Copia de los conjuntos
+            # ------------------------------------------------------------------
+
+            datos_entrenamiento = train.copy()
+            datos_validacion = validation.copy()
+
+            # ------------------------------------------------------------------
+            # Conversión de las fechas
+            # ------------------------------------------------------------------
+
+            datos_entrenamiento["ds"] = pd.to_datetime(
+                datos_entrenamiento["ds"]
+            )
+
+            datos_validacion["ds"] = pd.to_datetime(
+                datos_validacion["ds"]
+            )
+
+            # ------------------------------------------------------------------
+            # Ordenación cronológica
+            # ------------------------------------------------------------------
+
+            datos_entrenamiento = datos_entrenamiento.sort_values(
+                by="ds"
+            ).reset_index(
+                drop=True
+            )
+
+            datos_validacion = datos_validacion.sort_values(
+                by="ds"
+            ).reset_index(
+                drop=True
+            )
+
+            # ------------------------------------------------------------------
+            # Creación del modelo
+            # ------------------------------------------------------------------
+
+            modelo = NeuralProphet(
+                **parametros_modelo
+            )
+
+            # ------------------------------------------------------------------
+            # Incorporación de los regresores retardados
+            # ------------------------------------------------------------------
+
+            for variable in regresores_retardados:
+
+                modelo.add_lagged_regressor(
+                    names=variable,
+                    n_lags=params["n_lags"],
+                    normalize="standardize"
+                )
+
+            # ------------------------------------------------------------------
+            # Incorporación de los regresores futuros
+            # ------------------------------------------------------------------
+
+            for variable in regresores_futuros:
+
+                modelo.add_future_regressor(
+                    name=variable,
+                    normalize="standardize",
+                    mode=params["seasonality_mode"]
+                )
+
+            # ------------------------------------------------------------------
+            # Incorporación de los festivos nacionales de España
+            # ------------------------------------------------------------------
+
+            if usar_festivos:
+
+                modelo.add_country_holidays(
+                    country_name="ES"
+                )
+
+            # ------------------------------------------------------------------
+            # Entrenamiento
+            # ------------------------------------------------------------------
+
+            modelo.fit(
+                datos_entrenamiento,
+                freq="h",
+                progress=None
+            )
+
+            # ------------------------------------------------------------------
+            # Contexto necesario para construir los primeros rezagos
+            # ------------------------------------------------------------------
+
+            contexto_entrenamiento = datos_entrenamiento.tail(
+                params["n_lags"]
+            ).copy()
+
+            datos_prediccion = pd.concat(
+                [
+                    contexto_entrenamiento,
+                    datos_validacion
+                ],
+                ignore_index=True
+            )
+
+            datos_prediccion = datos_prediccion.sort_values(
+                by="ds"
+            ).reset_index(
+                drop=True
+            )
+
+            # ------------------------------------------------------------------
+            # Predicción
+            # ------------------------------------------------------------------
+
+            prediccion = modelo.predict(
+                datos_prediccion
+            )
+
+            # ------------------------------------------------------------------
+            # Predicciones correspondientes al periodo de validación
+            # ------------------------------------------------------------------
+
+            prediccion_validacion = prediccion[
+                prediccion["ds"].isin(
+                    datos_validacion["ds"]
+                )
+            ][
+                [
+                    "ds",
+                    "yhat1"
+                ]
+            ].copy()
+
+            # ------------------------------------------------------------------
+            # Unión de valores reales y predicciones
+            # ------------------------------------------------------------------
+
+            comparacion_validacion = datos_validacion[
+                [
+                    "ds",
+                    "y"
+                ]
+            ].merge(
+                prediccion_validacion,
+                on="ds",
+                how="inner"
+            )
+
+            comparacion_validacion = comparacion_validacion.dropna(
+                subset=[
+                    "y",
+                    "yhat1"
+                ]
+            ).reset_index(
+                drop=True
+            )
+
+            if comparacion_validacion.empty:
+
+                raise ValueError(
+                    "NeuralProphet no ha generado predicciones válidas "
+                    "para el conjunto de validación."
+                )
+
+            # ------------------------------------------------------------------
+            # Cálculo del MSE
+            # ------------------------------------------------------------------
+
+            mse = mean_squared_error(
+                comparacion_validacion["y"],
+                comparacion_validacion["yhat1"]
+            )
+
+            # ------------------------------------------------------------------
+            # Almacenamiento del resultado
+            # ------------------------------------------------------------------
+
+            resultado = params.copy()
+
+            # Guardamos los órdenes de Fourier realmente utilizados.
+            # Las estacionalidades ausentes se almacenan como False.
+            resultado["yearly_seasonality"] = yearly_seasonality
+            resultado["weekly_seasonality"] = weekly_seasonality
+            resultado["daily_seasonality"] = daily_seasonality
+
+            resultado["MSE_validacion"] = mse
+
+            resultado["numero_predicciones"] = len(
+                comparacion_validacion
+            )
+
+            resultado["estado"] = "Correcto"
+
+            resultados_busqueda.append(
+                resultado
+            )
+
+        except Exception as error:
+
+            # ------------------------------------------------------------------
+            # Almacenamiento del error
+            # ------------------------------------------------------------------
+
+            resultado = params.copy()
+
+            resultado["yearly_seasonality"] = yearly_seasonality
+            resultado["weekly_seasonality"] = weekly_seasonality
+            resultado["daily_seasonality"] = daily_seasonality
+
+            resultado["MSE_validacion"] = np.nan
+            resultado["numero_predicciones"] = 0
+            resultado["estado"] = str(error)
+
+            resultados_busqueda.append(
+                resultado
+            )
+
+            if mostrar_resultado:
+
+                print(
+                    f"Error en la configuración "
+                    f"{numero_configuracion}:"
+                )
+
+                print(error)
+
+    # ==========================================================================
+    # CONVERSIÓN DE LOS RESULTADOS EN UN DATAFRAME
+    # ==========================================================================
+
+    resultados_df = pd.DataFrame(
+        resultados_busqueda
+    )
+
+    # ==========================================================================
+    # SELECCIÓN DE LAS CONFIGURACIONES CORRECTAS
+    # ==========================================================================
+
+    resultados_correctos = resultados_df[
+        resultados_df["estado"] == "Correcto"
+    ].copy()
+
+    resultados_correctos = resultados_correctos.sort_values(
+        by="MSE_validacion",
+        ascending=True
+    ).reset_index(
+        drop=True
+    )
+
+    # ==========================================================================
+    # CASO EN EL QUE NINGUNA CONFIGURACIÓN SEA CORRECTA
+    # ==========================================================================
+
+    if resultados_correctos.empty:
+
+        mejor_resultado = None
+        mejor_modelo = None
+
+        if mostrar_resultado:
+
+            print(
+                "\nNo se ha podido ajustar correctamente "
+                "ninguna configuración."
+            )
+
+            print(
+                "\nErrores encontrados:\n"
+            )
+
+            for indice, fila in resultados_df.iterrows():
+
+                print(
+                    f"Configuración {indice + 1}: "
+                    f"{fila['estado']}"
+                )
+
+        return (
+            resultados_df,
+            resultados_correctos,
+            mejor_resultado,
+            mejor_modelo
+        )
+
+    # ==========================================================================
+    # SELECCIÓN DE LA MEJOR CONFIGURACIÓN
+    # ==========================================================================
+
+    mejor_resultado = resultados_correctos.iloc[
+        0
+    ].copy()
+
+    mejores_parametros = mejor_resultado.to_dict()
+
+    # ==========================================================================
+    # ENTRENAMIENTO DEL MEJOR MODELO
+    # ==========================================================================
+
+    np.random.seed(42)
+    random.seed(42)
+    torch.manual_seed(42)
+
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(42)
+
+    datos_mejor_modelo = train.copy()
+
+    datos_mejor_modelo["ds"] = pd.to_datetime(
+        datos_mejor_modelo["ds"]
+    )
+
+    datos_mejor_modelo = datos_mejor_modelo.sort_values(
+        by="ds"
+    ).reset_index(
+        drop=True
+    )
+
+    parametros_mejor_modelo = {
+
+        # Tendencia
+        "growth": "linear",
+        "changepoints_range": mejores_parametros[
+            "changepoints_range"
+        ],
+        "trend_reg": mejores_parametros[
+            "trend_reg"
+        ],
+
+        # Estacionalidad
+        "seasonality_mode": mejores_parametros[
+            "seasonality_mode"
+        ],
+        "seasonality_reg": mejores_parametros[
+            "seasonality_reg"
+        ],
+        "yearly_seasonality": mejores_parametros[
+            "yearly_seasonality"
+        ],
+        "weekly_seasonality": mejores_parametros[
+            "weekly_seasonality"
+        ],
+        "daily_seasonality": mejores_parametros[
+            "daily_seasonality"
+        ],
+
+        # Autorregresión
+        "n_lags": mejores_parametros[
+            "n_lags"
+        ],
+        "n_forecasts": 1,
+        "ar_layers": mejores_parametros[
+            "ar_layers"
+        ],
+        "lagged_reg_layers": mejores_parametros[
+            "lagged_reg_layers"
+        ],
+
+        # Entrenamiento
+        "epochs": mejores_parametros[
+            "epochs"
+        ],
+        "batch_size": mejores_parametros[
+            "batch_size"
+        ]
+    }
+
+    mejor_modelo = NeuralProphet(
+        **parametros_mejor_modelo
+    )
+
+    for variable in regresores_retardados:
+
+        mejor_modelo.add_lagged_regressor(
+            names=variable,
+            n_lags=mejores_parametros["n_lags"],
+            normalize="standardize"
+        )
+
+    for variable in regresores_futuros:
+
+        mejor_modelo.add_future_regressor(
+            name=variable,
+            normalize="standardize",
+            mode=mejores_parametros["seasonality_mode"]
+        )
+
+    if mejores_parametros["usar_festivos"]:
+
+        mejor_modelo.add_country_holidays(
+            country_name="ES"
+        )
+
+    mejor_modelo.fit(
+        datos_mejor_modelo,
+        freq="h",
+        progress=None
+    )
+
+    # ==========================================================================
+    # PRESENTACIÓN DE LOS RESULTADOS
+    # ==========================================================================
+
+    if mostrar_resultado:
+
+        print(
+            "\nEstacionalidades utilizadas:"
+        )
+
+        if estacionalidades_normalizadas:
+
+            for estacionalidad in estacionalidades_normalizadas:
+
+                nombre_parametro = (
+                    f"{estacionalidad}_seasonality"
+                )
+
+                print(
+                    f"- {estacionalidad}: "
+                    f"{mejor_resultado[nombre_parametro]}"
+                )
+
+        print(
+            "\nMejores parámetros:\n"
+        )
+
+        parametros_mostrar = [
+            "changepoints_range",
+            "trend_reg",
+            "seasonality_mode",
+            "seasonality_reg"
+        ]
+
+        if "yearly" in estacionalidades_normalizadas:
+            parametros_mostrar.append(
+                "yearly_seasonality"
+            )
+
+        if "weekly" in estacionalidades_normalizadas:
+            parametros_mostrar.append(
+                "weekly_seasonality"
+            )
+
+        if "daily" in estacionalidades_normalizadas:
+            parametros_mostrar.append(
+                "daily_seasonality"
+            )
+
+        parametros_mostrar += [
+            "n_lags",
+            "ar_layers",
+            "lagged_reg_layers",
+            "epochs",
+            "batch_size",
+            "usar_festivos"
+        ]
+
+        for parametro in parametros_mostrar:
+
+            print(
+                f"{parametro}: "
+                f"{mejor_resultado[parametro]}"
+            )
+
+        print(
+            f"\nMSE de validación: "
+            f"{mejor_resultado['MSE_validacion']:.8f}"
+        )
+
+    return (
+        resultados_df,
+        resultados_correctos,
+        mejor_resultado,
+        mejor_modelo
+    )
+
+
+
+def ENTRENAR_EVALUAR_NEURALPROPHET(
+    train,
+    validation,
+    regresores_futuros,
+    regresores_retardados,
+    mejores_parametros
+):
+    """
+    Entrena y evalúa un modelo NeuralProphet utilizando los mejores
+    hiperparámetros obtenidos previamente.
+
+    Las estacionalidades anual, semanal y diaria se activan únicamente
+    cuando aparecen en el diccionario 'mejores_parametros'. Si alguna
+    no aparece, se establece como False.
+
+    Parámetros
+    ----------
+    train : pandas.DataFrame
+        Conjunto de entrenamiento con las columnas 'ds', 'y' y los
+        regresores utilizados.
+
+    validation : pandas.DataFrame
+        Conjunto de validación con las columnas 'ds', 'y' y los
+        regresores utilizados.
+
+    regresores_futuros : list
+        Lista con los nombres de los regresores futuros.
+
+    regresores_retardados : list
+        Lista con los nombres de los regresores retardados.
+
+    mejores_parametros : dict
+        Diccionario con los mejores hiperparámetros del modelo.
+
+    Retorna
+    -------
+    modelo_neuralprophet : NeuralProphet
+        Modelo NeuralProphet entrenado.
+
+    historial_entrenamiento : pandas.DataFrame
+        Historial generado durante el entrenamiento.
+
+    prediccion_validacion : pandas.DataFrame
+        Predicciones correspondientes al periodo de validación.
+
+    comparacion_validacion : pandas.DataFrame
+        Valores reales y predichos del conjunto de validación.
+
+    metricas_validacion : dict
+        Métricas calculadas mediante EVALUAR_METRICAS.
+
+    train_neuralprophet_final : pandas.DataFrame
+        Copia preparada del conjunto de entrenamiento.
+
+    validation_neuralprophet_final : pandas.DataFrame
+        Copia preparada del conjunto de validación.
+    """
+
+    # ==========================================================================
+    # COPIA DE LOS CONJUNTOS
+    # ==========================================================================
+
+    train_neuralprophet_final = train.copy()
+    validation_neuralprophet_final = validation.copy()
+
+    # ==========================================================================
+    # PREPARACIÓN DE LOS DATOS
+    # ==========================================================================
+
+    # Conversión de las fechas
+    train_neuralprophet_final["ds"] = pd.to_datetime(
+        train_neuralprophet_final["ds"]
+    )
+
+    validation_neuralprophet_final["ds"] = pd.to_datetime(
+        validation_neuralprophet_final["ds"]
+    )
+
+    # Ordenación cronológica
+    train_neuralprophet_final = train_neuralprophet_final.sort_values(
+        by="ds"
+    ).reset_index(drop=True)
+
+    validation_neuralprophet_final = (
+        validation_neuralprophet_final.sort_values(
+            by="ds"
+        ).reset_index(drop=True)
+    )
+
+    # ==========================================================================
+    # FIJACIÓN DE LAS SEMILLAS
+    # ==========================================================================
+
+    np.random.seed(42)
+    random.seed(42)
+    torch.manual_seed(42)
+
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(42)
+
+    # ==========================================================================
+    # ESTACIONALIDADES
+    # ==========================================================================
+
+    # Si una estacionalidad no aparece entre los mejores parámetros,
+    # se desactiva mediante False.
+    yearly_seasonality = mejores_parametros.get(
+        "yearly_seasonality",
+        False
+    )
+
+    weekly_seasonality = mejores_parametros.get(
+        "weekly_seasonality",
+        False
+    )
+
+    daily_seasonality = mejores_parametros.get(
+        "daily_seasonality",
+        False
+    )
+
+    # ==========================================================================
+    # CREACIÓN DEL MODELO
+    # ==========================================================================
+
+    modelo_neuralprophet = NeuralProphet(
+
+        # Tendencia
+        growth=mejores_parametros.get(
+            "growth",
+            "linear"
+        ),
+        changepoints_range=mejores_parametros[
+            "changepoints_range"
+        ],
+        trend_reg=mejores_parametros[
+            "trend_reg"
+        ],
+
+        # Estacionalidad
+        seasonality_mode=mejores_parametros[
+            "seasonality_mode"
+        ],
+        seasonality_reg=mejores_parametros[
+            "seasonality_reg"
+        ],
+        yearly_seasonality=yearly_seasonality,
+        weekly_seasonality=weekly_seasonality,
+        daily_seasonality=daily_seasonality,
+
+        # Autorregresión
+        n_lags=mejores_parametros[
+            "n_lags"
+        ],
+        n_forecasts=1,
+        ar_layers=mejores_parametros[
+            "ar_layers"
+        ],
+        lagged_reg_layers=mejores_parametros[
+            "lagged_reg_layers"
+        ],
+
+        # Entrenamiento
+        epochs=mejores_parametros[
+            "epochs"
+        ],
+        batch_size=mejores_parametros[
+            "batch_size"
+        ]
+    )
+
+    # ==========================================================================
+    # INCORPORACIÓN DE LOS REGRESORES RETARDADOS
+    # ==========================================================================
+
+    for variable in regresores_retardados:
+
+        modelo_neuralprophet.add_lagged_regressor(
+            names=variable,
+            n_lags=mejores_parametros["n_lags"],
+            normalize="standardize"
+        )
+
+    # ==========================================================================
+    # INCORPORACIÓN DE LOS REGRESORES FUTUROS
+    # ==========================================================================
+
+    for variable in regresores_futuros:
+
+        modelo_neuralprophet.add_future_regressor(
+            name=variable,
+            normalize="standardize",
+            mode=mejores_parametros["seasonality_mode"]
+        )
+
+    # ==========================================================================
+    # INCORPORACIÓN DE LOS FESTIVOS NACIONALES DE ESPAÑA
+    # ==========================================================================
+
+    if mejores_parametros["usar_festivos"]:
+
+        modelo_neuralprophet.add_country_holidays(
+            country_name="ES"
+        )
+
+    # ==========================================================================
+    # ENTRENAMIENTO DEL MODELO
+    # ==========================================================================
+
+    historial_entrenamiento = modelo_neuralprophet.fit(
+        train_neuralprophet_final,
+        freq="h",
+        progress=None
+    )
+
+    # ==========================================================================
+    # PREPARACIÓN DE LOS DATOS DE VALIDACIÓN
+    # ==========================================================================
+
+    # NeuralProphet necesita las últimas n_lags observaciones del conjunto
+    # de entrenamiento para construir los primeros retardos de validación.
+    contexto_entrenamiento = train_neuralprophet_final.tail(
+        mejores_parametros["n_lags"]
+    ).copy()
+
+    datos_prediccion_validacion = pd.concat(
+        [
+            contexto_entrenamiento,
+            validation_neuralprophet_final
+        ],
+        ignore_index=True
+    )
+
+    datos_prediccion_validacion = (
+        datos_prediccion_validacion.sort_values(
+            by="ds"
+        ).reset_index(drop=True)
+    )
+
+    # ==========================================================================
+    # PREDICCIÓN SOBRE EL CONJUNTO DE VALIDACIÓN
+    # ==========================================================================
+
+    prediccion_validacion_completa = modelo_neuralprophet.predict(
+        datos_prediccion_validacion
+    )
+
+    # ==========================================================================
+    # SELECCIÓN DE LAS PREDICCIONES DEL PERIODO DE VALIDACIÓN
+    # ==========================================================================
+
+    prediccion_validacion = prediccion_validacion_completa[
+        prediccion_validacion_completa["ds"].isin(
+            validation_neuralprophet_final["ds"]
+        )
+    ][
+        [
+            "ds",
+            "yhat1"
+        ]
+    ].copy()
+
+    # ==========================================================================
+    # UNIÓN DE LOS VALORES REALES Y LAS PREDICCIONES
+    # ==========================================================================
+
+    comparacion_validacion = validation_neuralprophet_final[
+        [
+            "ds",
+            "y"
+        ]
+    ].merge(
+        prediccion_validacion,
+        on="ds",
+        how="inner"
+    )
+
+    comparacion_validacion = comparacion_validacion.dropna(
+        subset=[
+            "y",
+            "yhat1"
+        ]
+    ).reset_index(drop=True)
+
+    # ==========================================================================
+    # EVALUACIÓN DEL MODELO
+    # ==========================================================================
+
+    num_parametros = (
+        len(regresores_retardados)
+        + len(regresores_futuros)
+    )
+
+    metricas_validacion = EVALUAR_METRICAS(
+        y_real=comparacion_validacion["y"],
+        y_predicho=comparacion_validacion["yhat1"],
+        num_parametros=num_parametros
+    )
+
+    return (
+        modelo_neuralprophet,
+        historial_entrenamiento,
+        prediccion_validacion,
+        comparacion_validacion,
+        metricas_validacion,
+        train_neuralprophet_final,
+        validation_neuralprophet_final
     )

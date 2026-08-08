@@ -1,5 +1,5 @@
 numpy
-pandas
+pandas==2.3.3
 requests
 beautifulsoup4
 cartopy
@@ -14,3 +14,5 @@ prophet
 matplotlib
 seaborn
 statsmodels
+torch
+neuralprophet
