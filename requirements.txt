@@ -16,3 +16,4 @@ seaborn
 statsmodels
 torch
 neuralprophet
+tensorflow

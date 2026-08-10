@@ -1,3 +1,12 @@
+import os
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+
+import warnings
+import tensorflow as tf
+
+warnings.filterwarnings("ignore")
+tf.get_logger().setLevel("ERROR")
+
 import numpy as np
 import pandas as pd
 import itertools
@@ -10,16 +19,15 @@ from prophet.plot import add_changepoints_to_plot
 from prophet.diagnostics import cross_validation, performance_metrics
 import torch
 from neuralprophet import NeuralProphet
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense
+from sklearn.preprocessing import MinMaxScaler
 
 from statsmodels.stats.outliers_influence import variance_inflation_factor
 from sklearn.impute import SimpleImputer
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import ParameterGrid
 from sklearn.metrics import mean_squared_error
-
-
-import warnings
-warnings.filterwarnings("ignore")
 
 import logging
 logging.getLogger("cmdstanpy").setLevel(logging.WARNING)
@@ -807,6 +815,7 @@ def EVALUAR_METRICAS(y_real, y_predicho, num_parametros):
     print(f'Raíz del error cuadrático medio normalizada (NRMSE): {nrmse:.2f} %')
 
     return resultados
+
 
 def CALCULAR_VIF(datos, variables):
     """
@@ -2720,4 +2729,766 @@ def ENTRENAR_EVALUAR_NEURALPROPHET(
         metricas_validacion,
         train_neuralprophet_final,
         validation_neuralprophet_final
+    )
+
+
+#############################################################################################
+###################################### FUNCIONES LSTM #######################################
+#############################################################################################
+
+def ESCALADOR(
+    train,
+    validation,
+    test,
+    variables_exogenas
+):
+    """
+    Escala la variable objetivo y las variables exógenas utilizando
+    MinMaxScaler con rango [0, 1].
+
+    Los escaladores se ajustan únicamente sobre el conjunto de entrenamiento
+    y posteriormente se aplican a entrenamiento, validación y test.
+
+    Parámetros
+    ----------
+    train : pandas.DataFrame
+        Conjunto de entrenamiento.
+
+    validation : pandas.DataFrame
+        Conjunto de validación.
+
+    test : pandas.DataFrame
+        Conjunto de test.
+
+    variables_exogenas : list
+        Lista con los nombres de las variables exógenas que se escalarán.
+
+    Retorna
+    -------
+    train_lstm : pandas.DataFrame
+        Conjunto de entrenamiento escalado.
+
+    validation_lstm : pandas.DataFrame
+        Conjunto de validación escalado.
+
+    test_lstm : pandas.DataFrame
+        Conjunto de test escalado.
+
+    scaler_y : MinMaxScaler
+        Escalador ajustado sobre la variable objetivo.
+
+    scaler_X : MinMaxScaler
+        Escalador ajustado sobre las variables exógenas.
+    """
+
+    # ==========================================================================
+    # COPIAS DE LOS CONJUNTOS DE DATOS
+    # ==========================================================================
+
+    train_lstm = train.copy()
+    validation_lstm = validation.copy()
+    test_lstm = test.copy()
+
+    # ==========================================================================
+    # CONVERSIÓN Y ORDENACIÓN DE LAS FECHAS
+    # ==========================================================================
+
+    for df_lstm in [
+        train_lstm,
+        validation_lstm,
+        test_lstm
+    ]:
+
+        df_lstm["ds"] = pd.to_datetime(
+            df_lstm["ds"]
+        )
+
+        df_lstm.sort_values(
+            "ds",
+            inplace=True
+        )
+
+        df_lstm.reset_index(
+            drop=True,
+            inplace=True
+        )
+
+    # ==========================================================================
+    # ESCALADORES
+    # ==========================================================================
+
+    scaler_y = MinMaxScaler(
+        feature_range=(0, 1)
+    )
+
+    scaler_X = MinMaxScaler(
+        feature_range=(0, 1)
+    )
+
+    # ==========================================================================
+    # AJUSTE DE LOS ESCALADORES ÚNICAMENTE SOBRE ENTRENAMIENTO
+    # ==========================================================================
+
+    scaler_y.fit(
+        train_lstm[
+            [
+                "y"
+            ]
+        ]
+    )
+
+    scaler_X.fit(
+        train_lstm[
+            variables_exogenas
+        ]
+    )
+
+    # ==========================================================================
+    # TRANSFORMACIÓN DE LOS TRES CONJUNTOS
+    # ==========================================================================
+
+    for df_lstm in [
+        train_lstm,
+        validation_lstm,
+        test_lstm
+    ]:
+
+        df_lstm["y"] = scaler_y.transform(
+            df_lstm[
+                [
+                    "y"
+                ]
+            ]
+        ).ravel()
+
+        df_lstm[
+            variables_exogenas
+        ] = scaler_X.transform(
+            df_lstm[
+                variables_exogenas
+            ]
+        )
+
+    return (
+        train_lstm,
+        validation_lstm,
+        test_lstm,
+        scaler_y,
+        scaler_X
+    )
+
+
+
+def CREAR_DATASET_LSTM(df, input_size, variables_exogenas):
+    """
+    Crea secuencias temporales para entrenar una red LSTM.
+
+    Parámetros
+    ----------
+    df : pd.DataFrame
+        DataFrame con la variable objetivo 'y' y las variables exógenas.
+
+    input_size : int
+        Número de instantes temporales anteriores utilizados
+        para predecir el siguiente valor.
+
+    variables_exogenas : list
+        Lista de variables exógenas utilizadas como predictores.
+
+    Retorna
+    -------
+    X : np.ndarray
+        Matriz tridimensional con forma:
+        (n_muestras, input_size, n_variables).
+
+    y : np.ndarray
+        Valores de la variable objetivo correspondientes
+        al instante inmediatamente posterior a cada secuencia.
+    """
+
+    # Variables utilizadas como entrada
+    columnas_entrada = ["y"] + variables_exogenas
+
+    valores_X = df[columnas_entrada].values.astype(np.float32)
+    valores_y = df["y"].values.astype(np.float32)
+
+    X = []
+    y = []
+
+    for i in range(input_size, len(df)):
+
+        # Ventana con los input_size instantes anteriores
+        X.append(
+            valores_X[i - input_size:i]
+        )
+
+        # Valor de y en el instante siguiente
+        y.append(
+            valores_y[i]
+        )
+
+    return (
+        np.asarray(X, dtype=np.float32),
+        np.asarray(y, dtype=np.float32)
+    )
+
+
+
+def CREAR_DATASET_LSTM_VALIDATION(
+    train,
+    validation,
+    input_size,
+    variables_exogenas
+):
+    """
+    Crea las secuencias de validación incorporando las últimas
+    observaciones del conjunto de entrenamiento como contexto.
+    """
+
+    # Últimas observaciones del entrenamiento necesarias
+    contexto = train.tail(input_size)
+
+    # Las concatenamos con validación
+    df_completo = pd.concat(
+        [contexto, validation],
+        axis=0,
+        ignore_index=True
+    )
+
+    columnas_entrada = ["y"] + variables_exogenas
+
+    valores_X = df_completo[
+        columnas_entrada
+    ].values.astype(np.float32)
+
+    valores_y = df_completo[
+        "y"
+    ].values.astype(np.float32)
+
+    X = []
+    y = []
+
+    # Comenzamos justo donde empieza validación
+    for i in range(input_size, len(df_completo)):
+
+        X.append(
+            valores_X[i - input_size:i]
+        )
+
+        y.append(
+            valores_y[i]
+        )
+
+    return (
+        np.asarray(X, dtype=np.float32),
+        np.asarray(y, dtype=np.float32)
+    )
+
+
+
+def CONSTRUIR_MODELO_LSTM(
+    input_shape,
+    units,
+    num_layers,
+    dropout,
+    optimizer
+):
+    """
+    Construye y compila una red LSTM.
+
+    Parámetros
+    ----------
+    input_shape : tuple
+        Dimensiones de cada secuencia:
+        (input_size, número de variables).
+
+    units : int
+        Número de unidades de cada capa LSTM.
+
+    num_layers : int
+        Número de capas LSTM.
+
+    dropout : float
+        Proporción de dropout aplicada en las capas LSTM.
+
+    optimizer : str
+        Optimizador empleado durante el entrenamiento.
+
+    Retorna
+    -------
+    model : tf.keras.Model
+        Modelo LSTM compilado.
+    """
+
+    model = Sequential()
+
+    # --------------------------------------------------------------------------
+    # Primera capa LSTM
+    # --------------------------------------------------------------------------
+
+    if num_layers == 1:
+
+        model.add(
+            LSTM(
+                units=units,
+                dropout=dropout,
+                return_sequences=False,
+                input_shape=input_shape
+            )
+        )
+
+    else:
+
+        model.add(
+            LSTM(
+                units=units,
+                dropout=dropout,
+                return_sequences=True,
+                input_shape=input_shape
+            )
+        )
+
+        # ----------------------------------------------------------------------
+        # Capas LSTM adicionales
+        # ----------------------------------------------------------------------
+
+        for i in range(num_layers - 1):
+
+            ultima_capa = (i == num_layers - 2)
+
+            model.add(
+                LSTM(
+                    units=units,
+                    dropout=dropout,
+                    return_sequences=not ultima_capa
+                )
+            )
+
+    # --------------------------------------------------------------------------
+    # Capa de salida
+    # --------------------------------------------------------------------------
+
+    model.add(
+        Dense(1)
+    )
+
+    # --------------------------------------------------------------------------
+    # Compilación
+    # --------------------------------------------------------------------------
+
+    model.compile(
+        optimizer=optimizer,
+        loss="mean_squared_error"
+    )
+
+    return model
+
+
+
+def BUSQUEDA_CONFIGURACIONES_LSMT(
+    train,
+    validation,
+    variables_exogenas,
+    param_grid,
+    scaler_y,
+    seed=42
+):
+    """
+    Realiza una búsqueda de hiperparámetros para un modelo LSTM
+    utilizando ParameterGrid.
+
+    La selección se realiza según el MSE obtenido sobre
+    el conjunto de validación.
+
+    Parámetros
+    ----------
+    train : pd.DataFrame
+        Conjunto de entrenamiento escalado.
+
+    validation : pd.DataFrame
+        Conjunto de validación escalado.
+
+    variables_exogenas : list
+        Lista de variables exógenas utilizadas.
+
+    param_grid : dict
+        Diccionario con los hiperparámetros a evaluar.
+
+    scaler_y : MinMaxScaler
+        Escalador empleado para la variable objetivo.
+
+    seed : int
+        Semilla para garantizar reproducibilidad.
+
+    Retorna
+    -------
+    resultados : pd.DataFrame
+        Resultados obtenidos para todas las configuraciones.
+
+    mejor_configuracion : dict
+        Configuración que obtiene el menor MSE de validación.
+    """
+
+    # ==========================================================================
+    # Generación de configuraciones
+    # ==========================================================================
+
+    configuraciones = list(ParameterGrid(param_grid))
+
+    resultados = []
+
+    mejor_mse = np.inf
+    mejor_configuracion = None
+
+    # ==========================================================================
+    # Evaluación de cada configuración
+    # ==========================================================================
+
+    for params in configuraciones:
+
+        # ----------------------------------------------------------------------
+        # Semillas
+        # ----------------------------------------------------------------------
+
+        np.random.seed(seed)
+        random.seed(seed)
+        tf.random.set_seed(seed)
+
+        # Limpiar modelos anteriores de Keras
+        tf.keras.backend.clear_session()
+
+        # ----------------------------------------------------------------------
+        # Creación de secuencias
+        # ----------------------------------------------------------------------
+
+        X_train, y_train = CREAR_DATASET_LSTM(
+            train,
+            input_size=params["input_size"],
+            variables_exogenas=variables_exogenas
+        )
+
+        X_validation, y_validation = CREAR_DATASET_LSTM_VALIDATION(
+            train=train,
+            validation=validation,
+            input_size=params["input_size"],
+            variables_exogenas=variables_exogenas
+        )
+
+        # ----------------------------------------------------------------------
+        # Construcción del modelo
+        # ----------------------------------------------------------------------
+
+        model = CONSTRUIR_MODELO_LSTM(
+            input_shape=(
+                X_train.shape[1],
+                X_train.shape[2]
+            ),
+            units=params["units"],
+            num_layers=params["num_layers"],
+            dropout=params["dropout"],
+            optimizer=params["optimizer"]
+        )
+
+        # ----------------------------------------------------------------------
+        # Entrenamiento
+        # ----------------------------------------------------------------------
+
+        model.fit(
+            X_train,
+            y_train,
+            epochs=params["epochs"],
+            batch_size=params["batch_size"],
+            verbose=0,
+            shuffle=False
+        )
+
+        # ----------------------------------------------------------------------
+        # Predicción sobre validación
+        # ----------------------------------------------------------------------
+
+        pred_validation = model.predict(
+            X_validation,
+            verbose=0
+        )
+
+        # ----------------------------------------------------------------------
+        # Desescalado
+        # ----------------------------------------------------------------------
+
+        pred_validation_inv = scaler_y.inverse_transform(
+            pred_validation
+        ).ravel()
+
+        y_validation_inv = scaler_y.inverse_transform(
+            y_validation.reshape(-1, 1)
+        ).ravel()
+
+        # ----------------------------------------------------------------------
+        # MSE de validación
+        # ----------------------------------------------------------------------
+
+        mse_validation = mean_squared_error(
+            y_validation_inv,
+            pred_validation_inv
+        )
+
+        # ----------------------------------------------------------------------
+        # Guardar resultados
+        # ----------------------------------------------------------------------
+
+        resultado = params.copy()
+        resultado["MSE_validacion"] = mse_validation
+
+        resultados.append(resultado)
+
+        # ----------------------------------------------------------------------
+        # Actualización de la mejor configuración
+        # ----------------------------------------------------------------------
+
+        if mse_validation < mejor_mse:
+
+            mejor_mse = mse_validation
+            mejor_configuracion = params.copy()
+
+        # ----------------------------------------------------------------------
+        # Liberación de memoria
+        # ----------------------------------------------------------------------
+
+        del model
+        del X_train
+        del y_train
+        del X_validation
+        del y_validation
+
+        tf.keras.backend.clear_session()
+
+    # ==========================================================================
+    # DataFrame final de resultados
+    # ==========================================================================
+
+    resultados = pd.DataFrame(resultados)
+
+    resultados = resultados.sort_values(
+        by="MSE_validacion",
+        ascending=True
+    ).reset_index(drop=True)
+
+    # ==========================================================================
+    # Impresión de la mejor configuración
+    # ==========================================================================
+
+    print("Mejores parámetros:\n")
+
+    for parametro, valor in mejor_configuracion.items():
+        print(f"{parametro}: {valor}")
+
+    print(
+        f"\nMSE de validación: "
+        f"{mejor_mse:.6f}"
+    )
+
+    return resultados, mejor_configuracion
+
+
+def ENTRENAR_EVALUAR_LSTM(
+    train,
+    validation,
+    test,
+    variables_exogenas,
+    mejores_parametros,
+    scaler_y,
+    seed=42
+):
+    """
+    Entrena y evalúa el modelo LSTM final utilizando los mejores
+    hiperparámetros obtenidos durante la búsqueda.
+
+    El modelo final se entrena utilizando conjuntamente los conjuntos
+    de entrenamiento y validación, mientras que el conjunto de prueba
+    se reserva exclusivamente para la evaluación final.
+
+    Parámetros
+    ----------
+    train : pd.DataFrame
+        Conjunto de entrenamiento escalado.
+
+    validation : pd.DataFrame
+        Conjunto de validación escalado.
+
+    test : pd.DataFrame
+        Conjunto de prueba escalado.
+
+    variables_exogenas : list
+        Lista de variables exógenas utilizadas como predictores.
+
+    mejores_parametros : dict
+        Diccionario con los mejores hiperparámetros encontrados.
+
+    scaler_y : MinMaxScaler
+        Escalador utilizado para la variable objetivo.
+
+    seed : int, default=42
+        Semilla utilizada para garantizar reproducibilidad.
+
+    Retorna
+    -------
+    modelo : tf.keras.Model
+        Modelo LSTM final entrenado.
+
+    metricas : dict
+        Diccionario con las métricas obtenidas sobre test.
+
+    y_test_real : np.ndarray
+        Valores reales de la variable objetivo sin escalar.
+
+    y_test_predicho : np.ndarray
+        Predicciones del modelo sin escalar.
+
+    fechas_test : pd.Series
+        Fechas correspondientes a las predicciones realizadas.
+    """
+
+    # ==========================================================================
+    # Semillas para reproducibilidad
+    # ==========================================================================
+
+    np.random.seed(seed)
+    random.seed(seed)
+    tf.random.set_seed(seed)
+
+    tf.keras.backend.clear_session()
+
+
+    # ==========================================================================
+    # Unión de entrenamiento y validación
+    # ==========================================================================
+
+    train_final = pd.concat(
+        [train, validation],
+        axis=0,
+        ignore_index=True
+    )
+
+    train_final = train_final.sort_values(
+        by="ds"
+    ).reset_index(drop=True)
+
+
+    # ==========================================================================
+    # Extracción de los mejores hiperparámetros
+    # ==========================================================================
+
+    units = mejores_parametros["units"]
+    num_layers = mejores_parametros["num_layers"]
+    dropout = mejores_parametros["dropout"]
+    optimizer = mejores_parametros["optimizer"]
+    epochs = mejores_parametros["epochs"]
+    batch_size = mejores_parametros["batch_size"]
+    input_size = mejores_parametros["input_size"]
+
+
+    # ==========================================================================
+    # Creación de las secuencias de entrenamiento
+    # ==========================================================================
+
+    X_train, y_train = CREAR_DATASET_LSTM(
+        df=train_final,
+        input_size=input_size,
+        variables_exogenas=variables_exogenas
+    )
+
+
+    # ==========================================================================
+    # Creación de las secuencias de prueba
+    # ==========================================================================
+
+    X_test, y_test = CREAR_DATASET_LSTM_VALIDATION(
+        train=train_final,
+        validation=test,
+        input_size=input_size,
+        variables_exogenas=variables_exogenas
+    )
+
+
+    # ==========================================================================
+    # Construcción del modelo final
+    # ==========================================================================
+
+    modelo = CONSTRUIR_MODELO_LSTM(
+        input_shape=(
+            X_train.shape[1],
+            X_train.shape[2]
+        ),
+        units=units,
+        num_layers=num_layers,
+        dropout=dropout,
+        optimizer=optimizer
+    )
+
+
+    # ==========================================================================
+    # Entrenamiento del modelo
+    # ==========================================================================
+
+    modelo.fit(
+        X_train,
+        y_train,
+        epochs=epochs,
+        batch_size=batch_size,
+        verbose=0,
+        shuffle=False
+    )
+
+
+    # ==========================================================================
+    # Predicción sobre el conjunto de prueba
+    # ==========================================================================
+
+    y_test_predicho = modelo.predict(
+        X_test,
+        verbose=0
+    )
+
+
+    # ==========================================================================
+    # Desescalado
+    # ==========================================================================
+
+    y_test_real = scaler_y.inverse_transform(
+        y_test.reshape(-1, 1)
+    ).ravel()
+
+    y_test_predicho = scaler_y.inverse_transform(
+        y_test_predicho
+    ).ravel()
+
+
+    # ==========================================================================
+    # Evaluación del modelo
+    # ==========================================================================
+
+    metricas = EVALUAR_METRICAS(
+        y_real=y_test_real,
+        y_predicho=y_test_predicho,
+        num_parametros=len(variables_exogenas)
+    )
+
+
+    # ==========================================================================
+    # Fechas correspondientes a las predicciones
+    # ==========================================================================
+
+    fechas_test = test["ds"].reset_index(drop=True)
+
+
+    # ==========================================================================
+    # Retorno de resultados
+    # ==========================================================================
+
+    return (
+        modelo,
+        metricas,
+        y_test_real,
+        y_test_predicho,
+        fechas_test
     )
