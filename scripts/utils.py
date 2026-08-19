@@ -22,6 +22,8 @@ from neuralprophet import NeuralProphet
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import LSTM, Dense
 from sklearn.preprocessing import MinMaxScaler
+from pmdarima import auto_arima
+from statsmodels.tsa.statespace.sarimax import SARIMAX
 
 from statsmodels.stats.outliers_influence import variance_inflation_factor
 from sklearn.impute import SimpleImputer
@@ -1295,14 +1297,13 @@ def BUSQUEDA_CONFIGURACIONES_PROPHET(
 
     if mostrar_resultado:
 
-        print("MEJOR COMBINACIÓN DE HIPERPARÁMETROS:\n")
         print("Estacionalidades utilizadas:\n")
 
         if estacionalidades_normalizadas:
             for estacionalidad in estacionalidades_normalizadas:
                 print(f"- {estacionalidad}")
         else:
-            print("- Ninguna")
+            print()
 
         print("\nMejores parámetros:\n")
 
@@ -3491,4 +3492,552 @@ def ENTRENAR_EVALUAR_LSTM(
         y_test_real,
         y_test_predicho,
         fechas_test
+    )
+
+
+
+#############################################################################################
+##################################### FUNCIONES SARIMAX #####################################
+#############################################################################################
+
+
+def BUSQUEDA_CONFIGURACIONES_SARIMAX(
+    train,
+    validation,
+    variables_exogenas,
+    periodo_estacional=24
+):
+    """
+    Busca automáticamente tres configuraciones SARIMAX/ARIMAX:
+    - La que minimiza el AIC.
+    - La que minimiza el AICc.
+    - La que minimiza el BIC.
+
+    Si periodo_estacional es None, el modelo se considera
+    no estacional y se ajusta como ARIMAX.
+
+    Las búsquedas se realizan exclusivamente sobre el conjunto
+    de entrenamiento mediante auto_arima.
+
+    Posteriormente, las tres configuraciones seleccionadas se
+    ajustan sobre entrenamiento y se evalúan sobre validación.
+    La configuración final será aquella que presente el menor
+    MSE sobre el conjunto de validación.
+
+    Parámetros
+    ----------
+    train : pd.DataFrame
+        Conjunto de entrenamiento.
+
+    validation : pd.DataFrame
+        Conjunto de validación.
+
+    variables_exogenas : list
+        Variables exógenas empleadas por el modelo.
+
+    periodo_estacional : int or None, default=24
+        Periodicidad de la componente estacional.
+        Si es None, se ajusta un modelo no estacional.
+
+    Retorna
+    -------
+    resultados : pd.DataFrame
+        Resultados de los modelos seleccionados mediante
+        AIC, AICc y BIC.
+
+    mejor_configuracion : dict
+        Configuración con menor MSE sobre validación.
+
+    mejor_modelo :
+        Modelo SARIMAX/ARIMAX ajustado correspondiente a la
+        mejor configuración.
+    """
+
+    # ==========================================================================
+    # Variable objetivo
+    # ==========================================================================
+
+    y_train = train["y"]
+    y_validation = validation["y"]
+
+    # ==========================================================================
+    # Variables exógenas
+    # ==========================================================================
+
+    X_train = train[variables_exogenas]
+    X_validation = validation[variables_exogenas]
+
+    # ==========================================================================
+    # Configuración de la estacionalidad
+    # ==========================================================================
+
+    if periodo_estacional is None:
+
+        seasonal = False
+        m = 1
+
+    else:
+
+        seasonal = True
+        m = periodo_estacional
+
+    # ==========================================================================
+    # Criterios de información
+    # ==========================================================================
+
+    criterios = ["aic", "aicc", "bic"]
+
+    configuraciones = []
+
+    # ==========================================================================
+    # Búsqueda automática de configuraciones
+    # ==========================================================================
+
+    for criterio in criterios:
+
+        modelo_auto = auto_arima(
+            y=y_train,
+            X=X_train,
+
+            # ==============================================================
+            # Componente estacional
+            # ==============================================================
+
+            seasonal=seasonal,
+            m=m,
+
+            # ==============================================================
+            # Diferenciación
+            # ==============================================================
+
+            d=None,
+            D=None if seasonal else 0,
+
+            # ==============================================================
+            # Búsqueda de órdenes
+            # ==============================================================
+
+            start_p=0,
+            start_q=0,
+            max_p=8,
+            max_q=8,
+
+            start_P=0,
+            start_Q=0,
+            max_P=8 if seasonal else 0,
+            max_Q=8 if seasonal else 0,
+
+            # ==============================================================
+            # Criterio de selección
+            # ==============================================================
+
+            information_criterion=criterio,
+
+            # ==============================================================
+            # Configuración de la búsqueda
+            # ==============================================================
+
+            stepwise=True,
+            suppress_warnings=True,
+            error_action="ignore",
+            trace=False
+        )
+
+        # ======================================================================
+        # Órdenes seleccionados
+        # ======================================================================
+
+        order = modelo_auto.order
+
+        if seasonal:
+            seasonal_order = modelo_auto.seasonal_order
+        else:
+            seasonal_order = (0, 0, 0, 0)
+
+        configuraciones.append({
+            "criterio": criterio.upper(),
+            "order": order,
+            "seasonal_order": seasonal_order
+        })
+
+    # ==========================================================================
+    # Evaluación de las configuraciones sobre validación
+    # ==========================================================================
+
+    resultados = []
+
+    mejor_mse = np.inf
+    mejor_configuracion = None
+    mejor_modelo = None
+
+    for config in configuraciones:
+
+        criterio = config["criterio"]
+        order = config["order"]
+        seasonal_order = config["seasonal_order"]
+
+        try:
+
+            # ==============================================================
+            # Definición del modelo SARIMAX / ARIMAX
+            # ==============================================================
+
+            modelo = SARIMAX(
+                endog=y_train,
+                exog=X_train,
+                order=order,
+                seasonal_order=seasonal_order,
+                enforce_stationarity=False,
+                enforce_invertibility=False
+            )
+
+            # ==============================================================
+            # Ajuste exclusivamente sobre entrenamiento
+            # ==============================================================
+
+            modelo_ajustado = modelo.fit(
+                disp=False
+            )
+
+            # ==============================================================
+            # Predicción sobre validación
+            # ==============================================================
+
+            prediccion = modelo_ajustado.get_forecast(
+                steps=len(validation),
+                exog=X_validation
+            )
+
+            y_pred = np.asarray(
+                prediccion.predicted_mean
+            )
+
+            # ==============================================================
+            # MSE de validación
+            # ==============================================================
+
+            mse_validacion = metrics.mean_squared_error(
+                y_validation,
+                y_pred
+            )
+
+            # ==============================================================
+            # AICc
+            # ==============================================================
+
+            n = modelo_ajustado.nobs
+            k = len(modelo_ajustado.params)
+
+            if n - k - 1 > 0:
+
+                aicc = (
+                    modelo_ajustado.aic
+                    +
+                    (2 * k * (k + 1)) / (n - k - 1)
+                )
+
+            else:
+
+                aicc = np.nan
+
+            # ==============================================================
+            # Almacenar resultados
+            # ==============================================================
+
+            resultados.append({
+                "criterio_seleccion": criterio,
+
+                "p": order[0],
+                "d": order[1],
+                "q": order[2],
+
+                "P": seasonal_order[0],
+                "D": seasonal_order[1],
+                "Q": seasonal_order[2],
+                "s": periodo_estacional,
+
+                "AIC": modelo_ajustado.aic,
+                "AICc": aicc,
+                "BIC": modelo_ajustado.bic,
+
+                "MSE_validacion": mse_validacion
+            })
+
+            # ==============================================================
+            # Selección mediante MSE de validación
+            # ==============================================================
+
+            if mse_validacion < mejor_mse:
+
+                mejor_mse = mse_validacion
+
+                mejor_configuracion = {
+                    "criterio_seleccion": criterio,
+
+                    "p": order[0],
+                    "d": order[1],
+                    "q": order[2],
+
+                    "P": seasonal_order[0],
+                    "D": seasonal_order[1],
+                    "Q": seasonal_order[2],
+
+                    "s": periodo_estacional
+                }
+
+                mejor_modelo = modelo_ajustado
+
+        except Exception:
+            pass
+
+    # ==========================================================================
+    # DataFrame de resultados
+    # ==========================================================================
+
+    resultados = pd.DataFrame(resultados)
+
+    resultados.sort_values(
+        by="MSE_validacion",
+        ascending=True,
+        inplace=True
+    )
+
+    resultados.reset_index(
+        drop=True,
+        inplace=True
+    )
+
+    # ==========================================================================
+    # Resultado final
+    # ==========================================================================
+
+    print("Mejores parámetros:")
+    print()
+
+    print(f"s = {mejor_configuracion['s']}")
+    print(f"p = {mejor_configuracion['p']}")
+    print(f"d = {mejor_configuracion['d']}")
+    print(f"q = {mejor_configuracion['q']}")
+    print(f"P = {mejor_configuracion['P']}")
+    print(f"D = {mejor_configuracion['D']}")
+    print(f"Q = {mejor_configuracion['Q']}")
+
+    print()
+
+    print(
+        f"Criterio de Selección: "
+        f"{mejor_configuracion['criterio_seleccion']}"
+    )
+
+    print(
+        f"MSE de validación: {mejor_mse:.6f}"
+    )
+
+    return (
+        resultados,
+        mejor_configuracion,
+        mejor_modelo
+    )
+
+
+
+def ENTRENAR_EVALUAR_SARIMAX(
+    train,
+    validation,
+    test,
+    variables_exogenas,
+    mejores_parametros
+):
+    """
+    Entrena y evalúa un modelo SARIMAX/ARIMAX utilizando los
+    mejores hiperparámetros obtenidos previamente.
+
+    Si s es None, se ajusta un modelo no estacional.
+
+    El modelo se ajusta utilizando conjuntamente los conjuntos
+    de entrenamiento y validación y se evalúa exclusivamente
+    sobre el conjunto de prueba.
+
+    Parámetros
+    ----------
+    train : pd.DataFrame
+        Conjunto de entrenamiento.
+
+    validation : pd.DataFrame
+        Conjunto de validación.
+
+    test : pd.DataFrame
+        Conjunto de prueba.
+
+    variables_exogenas : list
+        Variables exógenas empleadas por el modelo.
+
+    mejores_parametros : dict
+        Diccionario con los mejores hiperparámetros:
+        p, d, q, P, D, Q y s.
+
+        Si s es None, se considera que no existe
+        componente estacional.
+
+    Retorna
+    -------
+    modelo_ajustado :
+        Modelo SARIMAX/ARIMAX final ajustado.
+
+    resultados : dict
+        Diccionario con las métricas de evaluación.
+
+    predicciones : np.ndarray
+        Predicciones realizadas sobre el conjunto de prueba.
+    """
+
+    # ==========================================================================
+    # Unión de entrenamiento y validación
+    # ==========================================================================
+
+    train_validation = pd.concat(
+        [train, validation],
+        ignore_index=True
+    )
+
+    # ==========================================================================
+    # Conversión y ordenación temporal
+    # ==========================================================================
+
+    train_validation["ds"] = pd.to_datetime(
+        train_validation["ds"]
+    )
+
+    test_sarimax = test.copy()
+
+    test_sarimax["ds"] = pd.to_datetime(
+        test_sarimax["ds"]
+    )
+
+    train_validation.sort_values(
+        by="ds",
+        inplace=True
+    )
+
+    test_sarimax.sort_values(
+        by="ds",
+        inplace=True
+    )
+
+    train_validation.reset_index(
+        drop=True,
+        inplace=True
+    )
+
+    test_sarimax.reset_index(
+        drop=True,
+        inplace=True
+    )
+
+    # ==========================================================================
+    # Variable objetivo
+    # ==========================================================================
+
+    y_train_validation = train_validation["y"]
+    y_test = test_sarimax["y"]
+
+    # ==========================================================================
+    # Variables exógenas
+    # ==========================================================================
+
+    X_train_validation = train_validation[
+        variables_exogenas
+    ]
+
+    X_test = test_sarimax[
+        variables_exogenas
+    ]
+
+    # ==========================================================================
+    # Hiperparámetros
+    # ==========================================================================
+
+    p = mejores_parametros["p"]
+    d = mejores_parametros["d"]
+    q = mejores_parametros["q"]
+
+    P = mejores_parametros["P"]
+    D = mejores_parametros["D"]
+    Q = mejores_parametros["Q"]
+
+    s = mejores_parametros["s"]
+
+    # ==========================================================================
+    # Componente estacional
+    # ==========================================================================
+
+    if s is None:
+
+        seasonal_order = (0, 0, 0, 0)
+
+    else:
+
+        seasonal_order = (
+            P,
+            D,
+            Q,
+            s
+        )
+
+    # ==========================================================================
+    # Definición del modelo SARIMAX / ARIMAX
+    # ==========================================================================
+
+    modelo = SARIMAX(
+        endog=y_train_validation,
+        exog=X_train_validation,
+        order=(p, d, q),
+        seasonal_order=seasonal_order,
+        enforce_stationarity=False,
+        enforce_invertibility=False
+    )
+
+    # ==========================================================================
+    # Entrenamiento del modelo
+    # ==========================================================================
+
+    modelo_ajustado = modelo.fit(
+        disp=False
+    )
+
+    # ==========================================================================
+    # Predicción sobre el conjunto de prueba
+    # ==========================================================================
+
+    prediccion = modelo_ajustado.get_forecast(
+        steps=len(test_sarimax),
+        exog=X_test
+    )
+
+    predicciones = np.asarray(
+        prediccion.predicted_mean
+    )
+
+    # ==========================================================================
+    # Número de parámetros del modelo
+    # ==========================================================================
+
+    num_parametros = len(
+        modelo_ajustado.params
+    )
+
+    # ==========================================================================
+    # Evaluación del modelo
+    # ==========================================================================
+
+    resultados = EVALUAR_METRICAS(
+        y_real=y_test,
+        y_predicho=predicciones,
+        num_parametros=num_parametros
+    )
+
+    return (
+        modelo_ajustado,
+        resultados,
+        predicciones
     )

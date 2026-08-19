@@ -17,3 +17,5 @@ statsmodels
 torch
 neuralprophet
 tensorflow
+Cython
+pmdarima
