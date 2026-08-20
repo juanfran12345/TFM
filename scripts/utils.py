@@ -3294,19 +3294,14 @@ def BUSQUEDA_CONFIGURACIONES_LSMT(
 def ENTRENAR_EVALUAR_LSTM(
     train,
     validation,
-    test,
     variables_exogenas,
     mejores_parametros,
     scaler_y,
     seed=42
 ):
     """
-    Entrena y evalúa el modelo LSTM final utilizando los mejores
-    hiperparámetros obtenidos durante la búsqueda.
-
-    El modelo final se entrena utilizando conjuntamente los conjuntos
-    de entrenamiento y validación, mientras que el conjunto de prueba
-    se reserva exclusivamente para la evaluación final.
+    Entrena el modelo LSTM con el conjunto de entrenamiento y evalúa 
+    las predicciones sobre el conjunto de validación.
 
     Parámetros
     ----------
@@ -3315,9 +3310,6 @@ def ENTRENAR_EVALUAR_LSTM(
 
     validation : pd.DataFrame
         Conjunto de validación escalado.
-
-    test : pd.DataFrame
-        Conjunto de prueba escalado.
 
     variables_exogenas : list
         Lista de variables exógenas utilizadas como predictores.
@@ -3334,18 +3326,18 @@ def ENTRENAR_EVALUAR_LSTM(
     Retorna
     -------
     modelo : tf.keras.Model
-        Modelo LSTM final entrenado.
+        Modelo LSTM entrenado.
 
     metricas : dict
-        Diccionario con las métricas obtenidas sobre test.
+        Diccionario con las métricas obtenidas sobre validación.
 
-    y_test_real : np.ndarray
-        Valores reales de la variable objetivo sin escalar.
+    y_val_real : np.ndarray
+        Valores reales de la variable objetivo sin escalar (validación).
 
-    y_test_predicho : np.ndarray
-        Predicciones del modelo sin escalar.
+    y_val_predicho : np.ndarray
+        Predicciones del modelo sin escalar (validación).
 
-    fechas_test : pd.Series
+    fechas_val : pd.Series
         Fechas correspondientes a las predicciones realizadas.
     """
 
@@ -3358,21 +3350,6 @@ def ENTRENAR_EVALUAR_LSTM(
     tf.random.set_seed(seed)
 
     tf.keras.backend.clear_session()
-
-
-    # ==========================================================================
-    # Unión de entrenamiento y validación
-    # ==========================================================================
-
-    train_final = pd.concat(
-        [train, validation],
-        axis=0,
-        ignore_index=True
-    )
-
-    train_final = train_final.sort_values(
-        by="ds"
-    ).reset_index(drop=True)
 
 
     # ==========================================================================
@@ -3393,26 +3370,26 @@ def ENTRENAR_EVALUAR_LSTM(
     # ==========================================================================
 
     X_train, y_train = CREAR_DATASET_LSTM(
-        df=train_final,
+        df=train,
         input_size=input_size,
         variables_exogenas=variables_exogenas
     )
 
 
     # ==========================================================================
-    # Creación de las secuencias de prueba
+    # Creación de las secuencias de validación
     # ==========================================================================
 
-    X_test, y_test = CREAR_DATASET_LSTM_VALIDATION(
-        train=train_final,
-        validation=test,
+    X_val, y_val = CREAR_DATASET_LSTM_VALIDATION(
+        train=train,
+        validation=validation,
         input_size=input_size,
         variables_exogenas=variables_exogenas
     )
 
 
     # ==========================================================================
-    # Construcción del modelo final
+    # Construcción del modelo
     # ==========================================================================
 
     modelo = CONSTRUIR_MODELO_LSTM(
@@ -3442,11 +3419,11 @@ def ENTRENAR_EVALUAR_LSTM(
 
 
     # ==========================================================================
-    # Predicción sobre el conjunto de prueba
+    # Predicción sobre el conjunto de validación
     # ==========================================================================
 
-    y_test_predicho = modelo.predict(
-        X_test,
+    y_val_predicho = modelo.predict(
+        X_val,
         verbose=0
     )
 
@@ -3455,12 +3432,12 @@ def ENTRENAR_EVALUAR_LSTM(
     # Desescalado
     # ==========================================================================
 
-    y_test_real = scaler_y.inverse_transform(
-        y_test.reshape(-1, 1)
+    y_val_real = scaler_y.inverse_transform(
+        y_val.reshape(-1, 1)
     ).ravel()
 
-    y_test_predicho = scaler_y.inverse_transform(
-        y_test_predicho
+    y_val_predicho = scaler_y.inverse_transform(
+        y_val_predicho
     ).ravel()
 
 
@@ -3469,8 +3446,8 @@ def ENTRENAR_EVALUAR_LSTM(
     # ==========================================================================
 
     metricas = EVALUAR_METRICAS(
-        y_real=y_test_real,
-        y_predicho=y_test_predicho,
+        y_real=y_val_real,
+        y_predicho=y_val_predicho,
         num_parametros=len(variables_exogenas)
     )
 
@@ -3479,7 +3456,7 @@ def ENTRENAR_EVALUAR_LSTM(
     # Fechas correspondientes a las predicciones
     # ==========================================================================
 
-    fechas_test = test["ds"].reset_index(drop=True)
+    fechas_val = validation["ds"].reset_index(drop=True)
 
 
     # ==========================================================================
@@ -3489,9 +3466,9 @@ def ENTRENAR_EVALUAR_LSTM(
     return (
         modelo,
         metricas,
-        y_test_real,
-        y_test_predicho,
-        fechas_test
+        y_val_real,
+        y_val_predicho,
+        fechas_val
     )
 
 
